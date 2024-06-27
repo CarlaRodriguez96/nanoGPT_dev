@@ -103,6 +103,21 @@ class Head(nn.Module):
         out = wei @ v # (B, T, T) @ (B, T, C) --> (B, T, C)
         
         return out
+    
+    
+    
+class MultiHeadAttention(nn.Module):
+    "These are multiple heads of self-attention in parallel"
+    
+    def __init__(self, num_heads, head_size):
+        super().__init__()
+        # SA heads in a list
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        
+    def forward(self, x):
+        # Concatenate all the outputs over the channel dimension (C)
+        return torch.cat([h(x) for h in self.heads], dim=-1)
+
 
 # Super simple Bigram model:
 class BigramLanguageModel(nn.Module):
@@ -115,9 +130,12 @@ class BigramLanguageModel(nn.Module):
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         # Position embedding table: each position from 0 to blocksize will get its own embedding vector
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
-        
         # Head selfattention
-        self.sa_head = Head(n_embd)
+        # self.sa_head = Head(n_embd)
+        # Multi-head:
+        # original n_embd = 32 --> if we have more heads, we divide the OG value by the number of heads
+        # this is because the output vectors get concatenated. 
+        self.sa_heads = MultiHeadAttention(4, n_embd//4) # 4 heads or 8 dim. self-attention
         # Linear layer that maps from the embedding size to the vocab size
         self.lm_head = nn.Linear(n_embd, vocab_size)
         
@@ -133,7 +151,8 @@ class BigramLanguageModel(nn.Module):
         # integers from 0 to T-1 are ambedded through the table to create a T by C. 
         x = token_emb + pos_emb # (B, T, C)
         # Feed into attention head
-        x = self.sa_head(x)
+        # x = self.sa_head(x)
+        x = self.sa_heads(x) # multi head
         logits = self.lm_head(x) # (B, T, vocab_size)-- Scores for the next character of the sequence 
         # -- we're predicting based on the identity of a single token
         
