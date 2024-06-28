@@ -6,15 +6,19 @@ from torch.nn import functional as F
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # Hyperparameters
-batch_size = 32 # 
-block_size = 8 #
-max_iters = 5000
+batch_size = 64 # batches
+block_size = 256 # context length
+max_iters = 5000 
 
-eval_interval = 300
-learning_rate = 1e-3
+eval_interval = 500
+learning_rate = 3e-4
+
 eval_iters = 200
+n_embd = 384
+n_head = 6 # every head is 384/6 = 64-dimensional 
+n_layer = 6 # number of multihead att. blocks 
+dropout = 0.2 # 20% of intermediate calculations are disabled and turned to 0
 
-n_embd = 32
 # -------------------
 
 torch.manual_seed(1337)
@@ -87,6 +91,10 @@ class Head(nn.Module):
         # Tril - buffer (instead of parameter) - lower triangular matrix. 
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
         
+        self.dropout = nn.Dropout(dropout) # regularisation techniqu: randomly shuts down some neuron connections and trains without them. 
+        # because the mask of what's being dropout changes every single for-back path, it ends up training an ensemble of subnetworks.
+        # scale the model, care about overfitting. 
+        
     def forward(self, x):
         B, T, C = x.shape # (Batch size, tokens, channels - dimensionality of the token)
         k = self.key(x) # (B, T, C)
@@ -98,27 +106,66 @@ class Head(nn.Module):
         # Decoder block -- doesn't communicate with the past
         wei = wei.masked_fill(self.tril[:T, :T] ==0, float('-inf')) # (B, T, T)
         wei = F.softmax(wei, dim=-1) # (B, T, T)
+        wei = self.dropout(wei)
         
         v = self.value(x) # (B, T, C)
         out = wei @ v # (B, T, T) @ (B, T, C) --> (B, T, C)
         
         return out
     
-    
-    
 class MultiHeadAttention(nn.Module):
     "These are multiple heads of self-attention in parallel"
-    
+    # With res. conn. 
     def __init__(self, num_heads, head_size):
         super().__init__()
         # SA heads in a list
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(n_embd, n_embd) # Late projection from residual blocks
+        self.dropout = nn.Dropout(dropout)
         
     def forward(self, x):
-        # Concatenate all the outputs over the channel dimension (C)
-        return torch.cat([h(x) for h in self.heads], dim=-1)
+        # 1st Concatenate all the outputs over the channel dimension (C)
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        # 2nd project -- back to the residual pathway
+        out = self.dropout(self.proj(out))
+        return out
 
 
+class FeedForward(nn.Module):
+    " Simple linear layer followed by a non-linearity"
+    
+    # Applied to each token individually. 
+    def __init__(self, n_embd):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, 4 * n_embd), # dim of input and output is d, the inner layer has 4xd in terms of channel sizes (arxiv)
+            nn.ReLU(), 
+            nn.Linear(4 * n_embd, n_embd), # projection layer going back to the residual pathway
+            nn.Dropout(dropout), # right before the connection back to the residual pathway
+        )
+        
+    def forward(self, x):
+        return self.net(x)
+
+
+class Block(nn.Module):
+    "transformer block: Communication + Computation (multihead self-att + feed-forward on the tokens independently)"
+    # Add residual connections 
+    def __init__(self, n_embd, n_head):
+        super().__init__()
+        head_size = n_embd//n_head # 'Cause later these are concatenated
+        self.sa = MultiHeadAttention(n_head, head_size)
+        self.ffwd = FeedForward(n_embd)
+        self.ln1 = nn.LayerNorm(n_embd) # 2 Layernorm
+        self.ln2 = nn.LayerNorm(n_embd)
+        
+    def forward(self, x):
+        # Apply the block: 1st MHSA, 2nd FFWD
+        x = x + self.sa(self.ln1(x)) # with residual connection; layernorms applied direclty on x
+        x = x + self.ffwd(self.ln2(x))
+        return x
+    
+    
 # Super simple Bigram model:
 class BigramLanguageModel(nn.Module):
     # Subclass of nn.module 
@@ -132,12 +179,18 @@ class BigramLanguageModel(nn.Module):
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
         # Head selfattention
         # self.sa_head = Head(n_embd)
-        # Multi-head:
-        # original n_embd = 32 --> if we have more heads, we divide the OG value by the number of heads
-        # this is because the output vectors get concatenated. 
-        self.sa_heads = MultiHeadAttention(4, n_embd//4) # 4 heads or 8 dim. self-attention
+        # ----------- Original code:
+        # # Multi-head:
+        # # original n_embd = 32 --> if we have more heads, we divide the OG value by the number of heads
+        # # this is b ecause the output vectors get concatenated. 
+        # self.sa_heads = MultiHeadAttention(4, n_embd//4) # 4 heads or 8 dim. self-attention
+        # self.ffwd = FeedForward(n_embd)
+        # ---------- Now implement Blocks of MHSA + FFWD:
+        self.blocks = nn.Sequential(*[Block(n_embd, n_head = n_head) for _ in range(n_layer)])
+        self.ln_f = nn.LayerNorm(n_embd) # final layer norm
         # Linear layer that maps from the embedding size to the vocab size
         self.lm_head = nn.Linear(n_embd, vocab_size)
+    
         
     def forward(self, idx, targets=None):
         # inputs and targets are passed to the token embedding table
@@ -152,7 +205,9 @@ class BigramLanguageModel(nn.Module):
         x = token_emb + pos_emb # (B, T, C)
         # Feed into attention head
         # x = self.sa_head(x)
-        x = self.sa_heads(x) # multi head
+        x = self.blocks(x) # multi head, (B, T, C)
+        x = self.ln_f(x) # (B, T C)
+        # x = self.ffwd(x) # (B, T, C)
         logits = self.lm_head(x) # (B, T, vocab_size)-- Scores for the next character of the sequence 
         # -- we're predicting based on the identity of a single token
         
